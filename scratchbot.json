@@ -1,0 +1,859 @@
+/*  ScratchMind — an AI that builds things in the Scratch editor.
+ *  HOW TO USE: open  https://scratch.mit.edu/projects/editor  → F12 → Console → paste this whole file → Enter.
+ *  (Chrome may ask you to type "allow pasting" first.)  Then just chat: "make a flappy bird game".
+ *
+ *  The brain runs locally (intent parser + game/behaviour templates + a block compiler).
+ *  Optional: type  /key sk-ant-...  in the chat to switch on the Claude brain for open-ended requests.
+ */
+(() => {
+'use strict';
+try { window.__scratchMind && window.__scratchMind.destroy(); } catch (e) {}
+
+/* ══════════════════════════════════════════════════════════════════
+   1. UTILS + FINDING THE SCRATCH VM
+   ══════════════════════════════════════════════════════════════════ */
+let _n = 0;
+const uid = () => 'sm' + (++_n).toString(36) + Math.random().toString(36).slice(2, 8);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+let VM = null;
+function findVM() {
+  if (VM && VM.runtime) return VM;
+  if (typeof window === 'undefined') return null;
+  if (window.vm && window.vm.runtime) return (VM = window.vm);
+  const els = document.querySelectorAll('div,canvas,button,span');
+  for (let i = 0; i < els.length && i < 4000; i++) {
+    const k = Object.keys(els[i]).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+    if (!k) continue;
+    let f = els[i][k], hops = 0;
+    while (f && hops++ < 100) {
+      const v = (f.memoizedProps && f.memoizedProps.vm) || (f.stateNode && f.stateNode.props && f.stateNode.props.vm);
+      if (v && v.runtime && v.runtime.getTargetForStage) return (VM = v);
+      f = f.return;
+    }
+  }
+  return null;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   2. BLOCK DSL  (tiny tree → real Scratch blocks)
+      node = { op, i:{inputs}, f:{fields}, m:mutation }
+      input value = number | string | node (reporter) | [nodes] (C-block substack)
+      field value = string | {var:'name'} | {bc:'message'}
+   ══════════════════════════════════════════════════════════════════ */
+const n = (op, i, f, m) => ({ op, i: i || {}, f: f || {}, m });
+const flag = () => n('event_whenflagclicked');
+const onKey = k => n('event_whenkeypressed', {}, { KEY_OPTION: k });
+const onClick = () => n('event_whenthisspriteclicked');
+const onStage = () => n('event_whenstageclicked');
+const onMsg = m => n('event_whenbroadcastreceived', {}, { BROADCAST_OPTION: { bc: m } });
+const onClone = () => n('control_start_as_clone');
+const forever = (...b) => n('control_forever', { SUBSTACK: b });
+const repeat = (t, ...b) => n('control_repeat', { TIMES: t, SUBSTACK: b });
+const until = (c, ...b) => n('control_repeat_until', { CONDITION: c, SUBSTACK: b });
+const iff = (c, ...b) => n('control_if', { CONDITION: c, SUBSTACK: b });
+const ife = (c, a, b) => n('control_if_else', { CONDITION: c, SUBSTACK: a, SUBSTACK2: b });
+const wait = s => n('control_wait', { DURATION: s });
+const clone = t => n('control_create_clone_of', { CLONE_OPTION: t });
+const delClone = () => n('control_delete_this_clone');
+const stopAll = () => n('control_stop', {}, { STOP_OPTION: 'all' }, { tagName: 'mutation', children: [], hasnext: 'false' });
+const bcast = m => n('event_broadcast', { BROADCAST_INPUT: m });
+const V = name => n('data_variable', {}, { VARIABLE: { var: name } });
+const set = (name, v) => n('data_setvariableto', { VALUE: v }, { VARIABLE: { var: name } });
+const chg = (name, v) => n('data_changevariableby', { VALUE: v }, { VARIABLE: { var: name } });
+const showVar = name => n('data_showvariable', {}, { VARIABLE: { var: name } });
+const show = () => n('looks_show');
+const hide = () => n('looks_hide');
+const front = () => n('looks_gotofrontback', {}, { FRONT_BACK: 'front' });
+const say = (m, s) => s ? n('looks_sayforsecs', { MESSAGE: m, SECS: s }) : n('looks_say', { MESSAGE: m });
+const setSize = v => n('looks_setsizeto', { SIZE: v });
+const chSize = v => n('looks_changesizeby', { CHANGE: v });
+const nextCostume = () => n('looks_nextcostume');
+const effect = (e, v) => n('looks_changeeffectby', { CHANGE: v }, { EFFECT: e });
+const goXY = (x, y) => n('motion_gotoxy', { X: x, Y: y });
+const goTo = t => n('motion_goto', { TO: t });
+const chX = v => n('motion_changexby', { DX: v });
+const chY = v => n('motion_changeyby', { DY: v });
+const setX = v => n('motion_setx', { X: v });
+const setY = v => n('motion_sety', { Y: v });
+const move = s => n('motion_movesteps', { STEPS: s });
+const point = d => n('motion_pointindirection', { DIRECTION: d });
+const turnR = d => n('motion_turnright', { DEGREES: d });
+const towards = t => n('motion_pointtowards', { TOWARDS: t });
+const bounce = () => n('motion_ifonedgebounce');
+const rotStyle = s => n('motion_setrotationstyle', {}, { STYLE: s });
+const xpos = () => n('motion_xposition');
+const ypos = () => n('motion_yposition');
+const dir = () => n('motion_direction');
+const mouseX = () => n('sensing_mousex');
+const touching = t => n('sensing_touchingobject', { TOUCHINGOBJECTMENU: t });
+const keyDown = k => n('sensing_keypressed', { KEY_OPTION: k });
+const ask = q => n('sensing_askandwait', { QUESTION: q });
+const answer = () => n('sensing_answer');
+const timer = () => n('sensing_timer');
+const resetTimer = () => n('sensing_resettimer');
+const rnd = (a, b) => n('operator_random', { FROM: a, TO: b });
+const add = (a, b) => n('operator_add', { NUM1: a, NUM2: b });
+const sub = (a, b) => n('operator_subtract', { NUM1: a, NUM2: b });
+const mul = (a, b) => n('operator_multiply', { NUM1: a, NUM2: b });
+const round = a => n('operator_round', { NUM: a });
+const gt = (a, b) => n('operator_gt', { OPERAND1: a, OPERAND2: b });
+const lt = (a, b) => n('operator_lt', { OPERAND1: a, OPERAND2: b });
+const eq = (a, b) => n('operator_equals', { OPERAND1: a, OPERAND2: b });
+const and = (a, b) => n('operator_and', { OPERAND1: a, OPERAND2: b });
+const or = (a, b) => n('operator_or', { OPERAND1: a, OPERAND2: b });
+const any = (...c) => c.reduce((a, b) => or(a, b));
+const join = (a, b) => n('operator_join', { STRING1: a, STRING2: b });
+const div = (a, b) => n('operator_divide', { NUM1: a, NUM2: b });
+const mouseDown = () => n('sensing_mousedown');
+const costume = c => n('looks_switchcostumeto', { COSTUME: c });
+const stopOther = () => n('control_stop', {}, { STOP_OPTION: 'other scripts in sprite' }, { tagName: 'mutation', children: [], hasnext: 'true' });
+const contains = (a, b) => n('operator_contains', { STRING1: a, STRING2: b });
+
+/* which inputs get a "shadow" (the little editable number/text bubble) */
+const SHT = { n: ['math_number', 'NUM'], p: ['math_positive_number', 'NUM'], w: ['math_whole_number', 'NUM'],
+              a: ['math_angle', 'NUM'], t: ['text', 'TEXT'], c: ['colour_picker', 'COLOUR'] };
+const SHSPEC = {
+  n: `motion_movesteps.STEPS motion_turnright.DEGREES motion_turnleft.DEGREES motion_gotoxy.X motion_gotoxy.Y
+      motion_changexby.DX motion_changeyby.DY motion_setx.X motion_sety.Y motion_glidesecstoxy.SECS
+      motion_glidesecstoxy.X motion_glidesecstoxy.Y looks_sayforsecs.SECS looks_thinkforsecs.SECS
+      looks_changesizeby.CHANGE looks_setsizeto.SIZE looks_seteffectto.VALUE looks_changeeffectby.CHANGE
+      operator_add.NUM1 operator_add.NUM2 operator_subtract.NUM1 operator_subtract.NUM2
+      operator_multiply.NUM1 operator_multiply.NUM2 operator_divide.NUM1 operator_divide.NUM2
+      operator_mod.NUM1 operator_mod.NUM2 operator_random.FROM operator_random.TO operator_round.NUM
+      operator_mathop.NUM operator_letter_of.LETTER data_changevariableby.VALUE`,
+  p: 'control_wait.DURATION',
+  w: 'control_repeat.TIMES',
+  a: 'motion_pointindirection.DIRECTION',
+  t: `looks_say.MESSAGE looks_sayforsecs.MESSAGE looks_think.MESSAGE looks_thinkforsecs.MESSAGE
+      sensing_askandwait.QUESTION operator_gt.OPERAND1 operator_gt.OPERAND2 operator_lt.OPERAND1
+      operator_lt.OPERAND2 operator_equals.OPERAND1 operator_equals.OPERAND2 operator_join.STRING1
+      operator_join.STRING2 operator_contains.STRING1 operator_contains.STRING2 operator_length.STRING
+      operator_letter_of.STRING data_setvariableto.VALUE`,
+  c: 'sensing_touchingcolor.COLOR'
+};
+const SH = {};
+for (const [t, s] of Object.entries(SHSPEC)) s.trim().split(/\s+/).forEach(k => (SH[k] = SHT[t]));
+const MENUS = {
+  'motion_goto.TO': ['motion_goto_menu', 'TO'],
+  'motion_pointtowards.TOWARDS': ['motion_pointtowards_menu', 'TOWARDS'],
+  'looks_switchcostumeto.COSTUME': ['looks_costume', 'COSTUME'],
+  'control_create_clone_of.CLONE_OPTION': ['control_create_clone_of_menu', 'CLONE_OPTION'],
+  'sensing_touchingobject.TOUCHINGOBJECTMENU': ['sensing_touchingobjectmenu', 'TOUCHINGOBJECTMENU'],
+  'sensing_keypressed.KEY_OPTION': ['sensing_keyoptions', 'KEY_OPTION'],
+  'sensing_distanceto.DISTANCETOMENU': ['sensing_distancetomenu', 'DISTANCETOMENU'],
+  'event_broadcast.BROADCAST_INPUT': ['event_broadcast_menu', 'BROADCAST_OPTION'],
+  'event_broadcastandwait.BROADCAST_INPUT': ['event_broadcast_menu', 'BROADCAST_OPTION']
+};
+
+/* compile scripts → flat VM block list.  env = { names, v(name)→id, bc(name)→id } */
+function compile(scripts, env, x0 = 30, y0 = 20) {
+  const blocks = [], byId = {};
+  const put = b => (blocks.push(b), (byId[b.id] = b));
+  const shadow = (def, parent, value, isMenu) => {
+    const id = uid(), [type, field] = def;
+    const fv = type === 'event_broadcast_menu'
+      ? { name: field, value: String(value), id: env.bc(String(value)), variableType: 'broadcast_msg' }
+      : { name: field, value: isMenu ? String(env.names[value] || value) : String(value) };
+    put({ id, opcode: type, inputs: {}, fields: { [field]: fv }, next: null, parent, shadow: true, topLevel: false });
+    return id;
+  };
+  const stack = (nodes, parent) => {
+    nodes = nodes.flatMap((nd, i) => nd.op === 'data_showvariable' && nodes[i + 1] && nodes[i + 1].op === 'data_showvariable' ? [nd, wait(0.05)] : [nd]);
+    let first = null, prev = null;
+    for (const nd of nodes) {
+      const id = emit(nd, prev ? prev.id : parent);
+      if (prev) prev.next = id; else first = id;
+      prev = byId[id];
+    }
+    return first;
+  };
+  const emit = (nd, parent) => {
+    const id = uid();
+    const b = put({ id, opcode: nd.op, inputs: {}, fields: {}, next: null, parent, shadow: false, topLevel: false });
+    if (nd.m) b.mutation = nd.m;
+    for (const [k, v] of Object.entries(nd.i || {})) {
+      const key = nd.op + '.' + k, isMenu = !!MENUS[key], def = MENUS[key] || SH[key];
+      if (Array.isArray(v)) {
+        if (v.length) b.inputs[k] = { name: k, block: stack(v, id), shadow: null };
+      } else if (v && typeof v === 'object') {
+        const cid = emit(v, id);
+        b.inputs[k] = { name: k, block: cid, shadow: def ? shadow(def, id, isMenu || def[0] === 'text' ? '' : 0, isMenu) : null };
+      } else if (v !== undefined && v !== null) {
+        const d = def || (typeof v === 'number' ? SHT.n : SHT.t);
+        const sid = shadow(d, id, v, isMenu);
+        b.inputs[k] = { name: k, block: sid, shadow: sid };
+      }
+    }
+    for (const [k, v] of Object.entries(nd.f || {})) {
+      if (v && typeof v === 'object' && v.var !== undefined) b.fields[k] = { name: k, value: v.var, id: env.v(v.var), variableType: '' };
+      else if (v && typeof v === 'object' && v.bc !== undefined) b.fields[k] = { name: k, value: v.bc, id: env.bc(v.bc), variableType: 'broadcast_msg' };
+      else b.fields[k] = { name: k, value: String(v) };
+    }
+    return id;
+  };
+  let x = x0, y = y0, tops = 0;
+  for (const sc of scripts) {
+    if (!sc || !sc.length) continue;
+    const before = blocks.filter(b => !b.shadow).length;
+    const first = stack(sc, null), t = byId[first];
+    t.topLevel = true; t.parent = null; t.x = x; t.y = y;
+    y += (blocks.filter(b => !b.shadow).length - before) * 38 + 70;
+    if (y > 1100) { x += 440; y = y0; }
+    tops++;
+  }
+  return { blocks, tops };
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   3. ART  (every sprite & backdrop is generated as SVG)
+   ══════════════════════════════════════════════════════════════════ */
+const mix = (hex, t) => {
+  const v = parseInt(hex.slice(1), 16); let r = v >> 16, g = (v >> 8) & 255, b = v & 255;
+  const f = t < 0 ? 0 : 255, a = Math.abs(t);
+  r = Math.round(r + (f - r) * a); g = Math.round(g + (f - g) * a); b = Math.round(b + (f - b) * a);
+  return '#' + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1);
+};
+const ART = {
+  ball: c => [40, 40, `<circle cx="20" cy="20" r="18" fill="${c}" stroke="${mix(c, -.35)}" stroke-width="3"/><circle cx="13" cy="12" r="5" fill="#fff" opacity=".45"/>`],
+  paddle: c => [16, 90, `<rect x="1" y="1" width="14" height="88" rx="7" fill="${c}" stroke="${mix(c, -.35)}" stroke-width="2"/>`],
+  basket: c => [90, 40, `<path d="M4 6H86L76 36Q75 38 72 38H18Q15 38 14 36Z" fill="${c}" stroke="${mix(c, -.4)}" stroke-width="3" stroke-linejoin="round"/><rect x="2" y="2" width="86" height="8" rx="4" fill="${mix(c, -.25)}"/>`],
+  apple: c => [36, 40, `<circle cx="18" cy="23" r="15" fill="${c}" stroke="${mix(c, -.4)}" stroke-width="2.5"/><path d="M18 9Q18 3 22 1" stroke="#6b4226" stroke-width="3" fill="none" stroke-linecap="round"/><ellipse cx="25" cy="6" rx="6" ry="3" fill="#3ecf6b" transform="rotate(-25 25 6)"/>`],
+  star: c => [40, 40, `<polygon points="20,2 25.5,14.5 39,15.5 28.8,24.5 32,38 20,30.8 8,38 11.2,24.5 1,15.5 14.5,14.5" fill="${c}" stroke="${mix(c, -.4)}" stroke-width="2" stroke-linejoin="round"/>`],
+  coin: c => [36, 36, `<circle cx="18" cy="18" r="16" fill="${c}" stroke="${mix(c, -.45)}" stroke-width="3"/><circle cx="18" cy="18" r="10" fill="none" stroke="${mix(c, -.3)}" stroke-width="2.5"/>`],
+  hero: c => [40, 56, `<rect x="6" y="22" width="28" height="30" rx="9" fill="${c}" stroke="${mix(c, -.4)}" stroke-width="2.5"/><circle cx="20" cy="16" r="13" fill="#ffe0bd" stroke="#0003" stroke-width="2"/><circle cx="15" cy="15" r="2.2" fill="#222"/><circle cx="25" cy="15" r="2.2" fill="#222"/><path d="M14 21Q20 26 26 21" stroke="#222" fill="none" stroke-width="2" stroke-linecap="round"/>`],
+  enemy: c => [44, 44, `<circle cx="22" cy="22" r="20" fill="${c}" stroke="${mix(c, -.4)}" stroke-width="3"/><circle cx="14" cy="18" r="5.5" fill="#fff"/><circle cx="30" cy="18" r="5.5" fill="#fff"/><circle cx="15" cy="19" r="2.5" fill="#222"/><circle cx="29" cy="19" r="2.5" fill="#222"/><path d="M7 9L18 14M37 9L26 14" stroke="#222" stroke-width="3" stroke-linecap="round"/><path d="M13 32Q22 26 31 32" stroke="#222" stroke-width="3" fill="none" stroke-linecap="round"/>`],
+  alien: c => [48, 38, `<ellipse cx="24" cy="26" rx="22" ry="9" fill="${c}" stroke="${mix(c, -.4)}" stroke-width="2.5"/><path d="M10 24Q24 -4 38 24Z" fill="#bfe9ff" stroke="${mix(c, -.4)}" stroke-width="2.5" stroke-linejoin="round"/><circle cx="12" cy="27" r="2.2" fill="#fff"/><circle cx="24" cy="29" r="2.2" fill="#fff"/><circle cx="36" cy="27" r="2.2" fill="#fff"/>`],
+  ship: c => [44, 50, `<path d="M22 2L42 46L22 38L2 46Z" fill="${c}" stroke="${mix(c, -.4)}" stroke-width="2.5" stroke-linejoin="round"/><circle cx="22" cy="24" r="5" fill="#bfe9ff"/>`],
+  bullet: c => [8, 20, `<rect x="1" y="1" width="6" height="18" rx="3" fill="${c}" stroke="${mix(c, -.4)}" stroke-width="1.5"/>`],
+  bird: c => [54, 42, `<ellipse cx="26" cy="22" rx="22" ry="17" fill="${c}" stroke="${mix(c, -.4)}" stroke-width="2.5"/><path d="M44 18L53 22L44 27Z" fill="#ff9f40" stroke="#c46a10" stroke-width="1.5" stroke-linejoin="round"/><circle cx="35" cy="16" r="5" fill="#fff" stroke="#0003"/><circle cx="36.5" cy="16" r="2.2" fill="#222"/><path d="M8 24Q16 12 26 26Q16 32 8 24Z" fill="${mix(c, -.2)}" stroke="${mix(c, -.45)}" stroke-width="1.5"/>`],
+  pipe: c => [60, 520, `<g fill="${c}" stroke="${mix(c, -.45)}" stroke-width="3"><rect x="6" y="0" width="48" height="190"/><rect x="1" y="170" width="58" height="22" rx="4"/><rect x="6" y="330" width="48" height="190"/><rect x="1" y="328" width="58" height="22" rx="4"/></g>`],
+  cactus: c => [28, 52, `<g fill="${c}" stroke="${mix(c, -.45)}" stroke-width="2"><rect x="10" y="1" width="9" height="50" rx="4.5"/><rect x="1" y="17" width="13" height="7" rx="3.5"/><rect x="1" y="9" width="7" height="14" rx="3.5"/><rect x="15" y="26" width="12" height="7" rx="3.5"/><rect x="20" y="15" width="7" height="18" rx="3.5"/></g>`],
+  cookie: c => [120, 120, `<circle cx="60" cy="60" r="56" fill="${c}" stroke="${mix(c, -.4)}" stroke-width="4"/>` + [[38, 40], [74, 34], [84, 68], [50, 78], [30, 66], [66, 92], [92, 44]].map(([x, y]) => `<ellipse cx="${x}" cy="${y}" rx="7" ry="5.5" fill="#5b3418" transform="rotate(${x * 3} ${x} ${y})"/>`).join('')],
+  button: (c, l) => [128, 44, `<rect x="2" y="2" width="124" height="40" rx="12" fill="${c}" stroke="${mix(c, -.4)}" stroke-width="3"/><text x="64" y="29" font-family="Helvetica,Arial,sans-serif" font-weight="700" font-size="19" fill="#fff" text-anchor="middle">${esc(l || 'Click')}</text>`],
+  cube: c => [40, 40, `<rect x="2" y="2" width="36" height="36" rx="5" fill="${c}" stroke="#fff" stroke-width="3"/><rect x="9" y="11" width="8" height="8" fill="#101010"/><rect x="23" y="11" width="8" height="8" fill="#101010"/><rect x="10" y="26" width="20" height="4" fill="#101010"/>`],
+  spike: c => [36, 36, `<path d="M3 34L18 3L33 34Z" fill="${c}" stroke="#fff" stroke-width="2.5" stroke-linejoin="round"/><path d="M11 34L18 17L25 34Z" fill="#101010" opacity=".55"/>`],
+  spike2: c => [76, 36, `<g fill="${c}" stroke="#fff" stroke-width="2.5" stroke-linejoin="round"><path d="M3 34L19 3L35 34Z"/><path d="M41 34L57 3L73 34Z"/></g>`],
+  block: c => [40, 40, `<rect x="2" y="2" width="36" height="36" fill="${c}" stroke="#fff" stroke-width="3"/><rect x="10" y="10" width="20" height="20" fill="none" stroke="#fff" stroke-width="2.5" opacity=".7"/>`],
+  banner: (c, l) => [340, 96, `<rect x="3" y="3" width="334" height="90" rx="20" fill="#16122b" stroke="${c}" stroke-width="6"/><text x="170" y="62" font-family="Helvetica,Arial,sans-serif" font-weight="800" font-size="${Math.min(44, Math.floor(310 / (((l || 'GAME OVER').length) * 0.64)))}" fill="${c}" text-anchor="middle">${esc(l || 'GAME OVER')}</text>`]
+};
+const svgOf = (kind, color, label) => {
+  const [w, h, inner] = (ART[kind] || ART.ball)(color || '#4c97ff', label);
+  return { w, h, svg: `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">${inner}</svg>` };
+};
+const THEMES = {
+  sky: { c1: '#6ec6ff', c2: '#e3f5ff' }, night: { c1: '#070b24', c2: '#2a2f6b', stars: 1 },
+  ocean: { c1: '#0b3d91', c2: '#35c4e8' }, forest: { c1: '#a8e6a1', c2: '#3b9b62' },
+  desert: { c1: '#f9e0a8', c2: '#e9a65b' }, sunset: { c1: '#ff9a62', c2: '#5b3f8f' }, snow: { c1: '#cfe8ff', c2: '#f7fbff' },
+  dark: { c1: '#10131f', c2: '#1d2340' }, neon: { c1: '#1b0b4a', c2: '#5b1fa3', stars: 1 }
+};
+const bgFor = (p, def, extra) => Object.assign({}, THEMES[p.theme || def], extra);
+function bgSVG(bg) {
+  let x = '';
+  if (bg.stars) for (let i = 0; i < 60; i++) x += `<circle cx="${(i * 97) % 480}" cy="${(i * 53 + i * i * 7) % 360}" r="${(i % 3) + .8}" fill="#fff" opacity="${.35 + (i % 4) * .15}"/>`;
+  if (bg.ground) x += `<rect y="260" width="480" height="100" fill="${typeof bg.ground === 'string' ? bg.ground : '#c9a66b'}"/><rect y="260" width="480" height="6" fill="${bg.gline || '#8d6b3a'}"/>`;
+  if (bg.mid) x += `<line x1="240" y1="0" x2="240" y2="360" stroke="#fff" stroke-opacity=".25" stroke-width="4" stroke-dasharray="16 14"/>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="480" height="360" viewBox="0 0 480 360"><defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${bg.c1}"/><stop offset="1" stop-color="${bg.c2}"/></linearGradient></defs><rect width="480" height="360" fill="url(#g)"/>${x}</svg>`;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   4. REQUEST PARSING  (colours, themes, lives, difficulty…)
+   ══════════════════════════════════════════════════════════════════ */
+const COLORS = { red: '#ff4d4d', blue: '#4c97ff', green: '#3ecf6b', yellow: '#ffd23f', purple: '#9966ff', pink: '#ff7eb6', orange: '#ff9f40', black: '#3a3a4a', white: '#f4f4f4', gray: '#9aa0a6', grey: '#9aa0a6', cyan: '#35d0e0', teal: '#1fb5a8', brown: '#8d5a3b', gold: '#ffc107' };
+function parse(text) {
+  const s = text.toLowerCase();
+  const color = Object.keys(COLORS).find(c => new RegExp('\\b' + c + '\\b').test(s));
+  const th = [['night|space|galaxy|dark', 'night'], ['ocean|sea|underwater', 'ocean'], ['forest|jungle|grass', 'forest'],
+              ['desert|sand', 'desert'], ['sunset|dusk', 'sunset'], ['snow|winter|ice', 'snow']]
+              .find(([re]) => new RegExp('\\b(' + re + ')\\b').test(s));
+  const obj = [['apples?', 'apple'], ['stars?', 'star'], ['coins?|gold', 'coin'], ['balls?', 'ball']].find(([re]) => new RegExp('\\b(' + re + ')\\b').test(s));
+  return {
+    s, color: color && COLORS[color], theme: th && th[1], obj: obj && obj[1],
+    lives: +(s.match(/(\d+)\s*lives?/) || [])[1] || 0,
+    q: +(s.match(/(\d+)\s*(questions?|rounds?)/) || [])[1] || 5,
+    speed: /\b(fast|quick|hard|insane|crazy|harder)\b/.test(s) ? 1.4 : /\b(slow|easy|chill|relaxed|easier)\b/.test(s) ? 0.7 : 1,
+    bot: /\b(bots?|ai|computer|cpu|single ?player|1 ?player|one player|solo|against)\b/.test(s),
+    menu: /\b(menu|ui|buttons?|levels?|select|choose|pick|difficult\w*)\b/.test(s) || new Set(s.match(/\b(easy|normal|medium|hard)\b/g) || []).size > 1,
+    levelWords: (s.match(/\b(easy|normal|medium|hard)\b/g) || []).length,
+    level: (() => { const w = s.match(/\b(easy|normal|medium|hard)\b/g) || []; return w.length === 1 ? { easy: 1, normal: 2, medium: 2, hard: 3 }[w[0]] : 0; })(),
+    mode: /\b(times|multipl\w*)\b/.test(s) ? 'mul' : /\b(minus|subtract\w*|take away)\b/.test(s) ? 'sub' : 'add'
+  };
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   5. GAME TEMPLATES  → plan { title, replace, vars, bg, sprites[], stage[], how }
+   ══════════════════════════════════════════════════════════════════ */
+const banner = (key, text, msg, color = '#ff4d6d') => ({
+  key, kind: 'banner', label: text, color, x: 0, y: 0, hidden: true,
+  scripts: [[flag(), hide()], [onMsg(msg), goXY(0, 0), front(), show(), stopAll()]]
+});
+const T = {};
+
+T.catch = p => {
+  const fk = p.obj || 'apple', fc = { apple: '#ff4d4d', star: '#ffd23f', coin: '#ffc107', ball: '#ff7eb6' }[fk];
+  const sp = +(3 * p.speed).toFixed(1), lives = p.lives || 3;
+  return { title: 'Catch game', replace: true, vars: ['score', 'lives', 'speed'], bg: bgFor(p, 'sky'),
+    sprites: [
+      { key: 'Basket', kind: 'basket', color: p.color || '#ff9f40', x: 0, y: -140, scripts: [
+        [flag(), set('score', 0), set('lives', lives), set('speed', sp), showVar('score'), showVar('lives'), goXY(0, -140), forever(setX(mouseX()))]] },
+      { key: 'Faller', kind: fk, color: fc, x: 0, y: 170, hidden: true, scripts: [
+        [flag(), hide(), wait(0.3), until(lt(V('lives'), 1), clone('_myself_'), wait(rnd(0.5, 1.1)))],
+        [onClone(), goXY(rnd(-200, 200), 170), show(),
+          until(or(lt(ypos(), -165), touching('Basket')), chY(sub(0, V('speed')))),
+          ife(touching('Basket'), [chg('score', 1), chg('speed', 0.1)], [chg('lives', -1), iff(lt(V('lives'), 1), bcast('game over'))]),
+          delClone()]] },
+      banner('Banner', 'GAME OVER', 'game over')],
+    how: `Move your mouse to steer the basket and catch the falling ${fk}s. Miss one and you lose a life (${lives} to start). They get faster the more you catch.` };
+};
+
+const pong2 = p => {
+  const sp = +(6 * p.speed).toFixed(1);
+  const paddle = (key, color, x, up, down) => ({ key, kind: 'paddle', color, x, y: 0, scripts: [
+    [flag(), goXY(x, 0), forever(iff(and(keyDown(up), lt(ypos(), 140)), chY(9)), iff(and(keyDown(down), gt(ypos(), -140)), chY(-9)))]] });
+  return { title: 'Pong', replace: true, vars: ['P1', 'P2'], bg: bgFor(p, 'dark', { mid: 1 }),
+    sprites: [
+      paddle('Left', '#4c97ff', -215, 'w', 's'), paddle('Right', '#ff4d6d', 215, 'up arrow', 'down arrow'),
+      { key: 'Ball', kind: 'ball', color: '#ffffff', size: 45, x: 0, y: 0, scripts: [[
+        flag(), set('P1', 0), set('P2', 0), showVar('P1'), showVar('P2'), goXY(0, 0), point(rnd(50, 130)), wait(1),
+        forever(move(sp),
+          iff(touching('Left'), point(sub(0, dir())), move(10)),
+          iff(touching('Right'), point(sub(0, dir())), move(10)),
+          iff(lt(xpos(), -222), chg('P2', 1), goXY(0, 0), point(rnd(-130, -50)), wait(0.8)),
+          iff(gt(xpos(), 222), chg('P1', 1), goXY(0, 0), point(rnd(50, 130)), wait(0.8)),
+          iff(gt(V('P1'), 4), bcast('p1 wins')), iff(gt(V('P2'), 4), bcast('p2 wins')), bounce())]] },
+      banner('P1Wins', 'P1 WINS!', 'p1 wins', '#4c97ff'), banner('P2Wins', 'P2 WINS!', 'p2 wins', '#ff4d6d')],
+    how: 'Two players. Left paddle: W / S. Right paddle: ↑ / ↓. First to 5 points wins.' };
+};
+
+T.pong = p => {
+  if (!(p.bot || p.menu || p.levelWords > 0)) return pong2(p);
+  const LV = [null, { n: 'Easy', bot: 3, zone: 45, ball: 5, c: '#3ecf6b' }, { n: 'Normal', bot: 5.5, zone: 25, ball: 6.5, c: '#ffab19' }, { n: 'Hard', bot: 8.5, zone: 8, ball: 8, c: '#ff4d6d' }];
+  const menu = p.menu, lv = p.level || 2;
+  const go = () => menu ? onMsg('start') : flag();
+  const setLv = L => [set('botSpeed', L.bot), set('botZone', L.zone), set('baseSpeed', L.ball)];
+  const btn = (i, y) => ({ key: 'Lvl' + LV[i].n, kind: 'button', label: LV[i].n, color: LV[i].c, size: 140, x: 0, y, scripts: [
+    [flag(), goXY(0, y), show()], [onClick(), ...setLv(LV[i]), bcast('start')], [onMsg('start'), hide()]] });
+  const sprites = [
+    { key: 'Left', kind: 'paddle', color: '#4c97ff', x: -215, y: 0, scripts: [[flag(), goXY(-215, 0),
+      forever(set('leftY', ypos()), iff(and(or(keyDown('w'), keyDown('up arrow')), lt(ypos(), 140)), chY(9)), iff(and(or(keyDown('s'), keyDown('down arrow')), gt(ypos(), -140)), chY(-9)))]] },
+    { key: 'Right', kind: 'paddle', color: '#ff4d6d', x: 215, y: 0, scripts: [[flag(), goXY(215, 0)],
+      [go(), wait(0.1), forever(set('rightY', ypos()),
+        iff(and(gt(V('ballY'), add(ypos(), V('botZone'))), lt(ypos(), 140)), chY(V('botSpeed'))),
+        iff(and(lt(V('ballY'), sub(ypos(), V('botZone'))), gt(ypos(), -140)), chY(sub(0, V('botSpeed')))))]] },
+    { key: 'Ball', kind: 'ball', color: '#ffffff', size: 45, x: 0, y: 0, scripts: [
+      [flag(), ...setLv(LV[lv]), goXY(0, 0), ...(menu ? [hide()] : [])],
+      [go(), wait(0.1), ...(menu ? [show()] : []), set('You', 0), set('Bot', 0), showVar('You'), showVar('Bot'), set('ballSpeed', V('baseSpeed')), goXY(0, 0), point(rnd(55, 125)), wait(1),
+        forever(set('ballY', ypos()), move(V('ballSpeed')),
+          iff(touching('Left'), point(sub(90, mul(sub(ypos(), V('leftY')), 0.9))), chg('ballSpeed', 0.4), move(10)),
+          iff(touching('Right'), point(add(-90, mul(sub(ypos(), V('rightY')), 0.9))), move(10)),
+          iff(gt(V('ballSpeed'), 14), set('ballSpeed', 14)),
+          iff(lt(xpos(), -222), chg('Bot', 1), goXY(0, 0), set('ballSpeed', V('baseSpeed')), point(rnd(55, 125)), wait(0.8)),
+          iff(gt(xpos(), 222), chg('You', 1), goXY(0, 0), set('ballSpeed', V('baseSpeed')), point(rnd(-125, -55)), wait(0.8)),
+          iff(gt(V('You'), 4), bcast('p1 wins')), iff(gt(V('Bot'), 4), bcast('p2 wins')), bounce())]] },
+    banner('P1Wins', 'YOU WIN!', 'p1 wins', '#3ecf6b'), banner('P2Wins', 'BOT WINS', 'p2 wins', '#ff4d6d')];
+  if (menu) sprites.push({ key: 'Title', kind: 'banner', label: 'CHOOSE LEVEL', color: '#ffd23f', size: 80, x: 0, y: 115, scripts: [[flag(), goXY(0, 115), show()], [onMsg('start'), hide()]] }, btn(1, 55), btn(2, 0), btn(3, -55));
+  return { title: 'Pong vs bot', replace: true, vars: ['You', 'Bot', 'ballY', 'ballSpeed', 'baseSpeed', 'botSpeed', 'botZone', 'leftY', 'rightY'], bg: bgFor(p, 'dark', { mid: 1 }), sprites,
+    how: (menu ? 'Click Easy, Normal or Hard to start. ' : `Playing the ${LV[lv].n} bot. `) + 'Move your paddle with W / S (or ↑ / ↓). Hit the ball with the edge of your paddle to aim it. The ball speeds up every rally, and first to 5 wins.' };
+};
+
+T.flappy = p => ({ title: 'Flappy bird', replace: true, vars: ['score', 'vy'], bg: bgFor(p, 'sky'),
+  sprites: [
+    { key: 'Bird', kind: 'bird', color: p.color || '#ffd23f', x: -100, y: 0, scripts: [
+      [flag(), set('score', 0), set('vy', 0), showVar('score'), goXY(-100, 0),
+        forever(chg('vy', -0.8), chY(V('vy')), iff(or(lt(ypos(), -165), gt(ypos(), 172)), bcast('game over')))],
+      [onKey('space'), set('vy', 9)], [onKey('up arrow'), set('vy', 9)]] },
+    { key: 'Pipe', kind: 'pipe', color: '#3ecf6b', x: 248, y: 0, hidden: true, scripts: [
+      [flag(), hide(), wait(1), forever(clone('_myself_'), wait(1.7))],
+      [onClone(), goXY(248, rnd(-80, 80)), show(),
+        until(lt(xpos(), -250), chX(-4), iff(eq(xpos(), -100), chg('score', 1)), iff(touching('Bird'), bcast('game over'))), delClone()]] },
+    banner('Banner', 'GAME OVER', 'game over')],
+  stage: [[onStage(), set('vy', 9)]],
+  how: 'Press SPACE (or ↑, or click the stage) to flap. Fly through the gaps in the pipes — every pipe you pass is a point.' });
+
+T.shooter = p => {
+  const sp = +(2.5 * p.speed).toFixed(1);
+  return { title: 'Space shooter', replace: true, vars: ['score', 'lives'], bg: bgFor(p, 'night'),
+    sprites: [
+      { key: 'Ship', kind: 'ship', color: p.color || '#4c97ff', x: 0, y: -145, scripts: [
+        [flag(), set('score', 0), set('lives', p.lives || 3), showVar('score'), showVar('lives'), goXY(0, -145),
+          forever(iff(and(or(keyDown('left arrow'), keyDown('a')), gt(xpos(), -215)), chX(-9)),
+                  iff(and(or(keyDown('right arrow'), keyDown('d')), lt(xpos(), 215)), chX(9)))],
+        [flag(), forever(iff(keyDown('space'), clone('Bullet'), wait(0.22)))]] },
+      { key: 'Bullet', kind: 'bullet', color: '#ffd23f', x: 0, y: -120, hidden: true, scripts: [
+        [flag(), hide()], [onClone(), goTo('Ship'), chY(26), show(), until(gt(ypos(), 172), chY(12)), delClone()]] },
+      { key: 'Alien', kind: 'alien', color: '#ff4d6d', x: 0, y: 170, hidden: true, scripts: [
+        [flag(), hide(), wait(0.3), until(lt(V('lives'), 1), clone('_myself_'), wait(rnd(0.7, 1.5)))],
+        [onClone(), goXY(rnd(-200, 200), 170), show(),
+          until(any(lt(ypos(), -150), touching('Bullet'), touching('Ship')), chY(-sp)),
+          ife(touching('Bullet'), [chg('score', 1)], [chg('lives', -1), iff(lt(V('lives'), 1), bcast('game over'))]),
+          delClone()]] },
+      banner('Banner', 'GAME OVER', 'game over')],
+    how: 'Move with ← → (or A / D), hold SPACE to fire. Shoot the aliens — if one reaches you or the bottom, you lose a life.' };
+};
+
+T.runner = p => ({ title: 'Runner', replace: true, vars: ['score', 'speed', 'vy'], bg: bgFor(p, 'sky', { ground: 1 }),
+  sprites: [
+    { key: 'Runner', kind: 'hero', color: p.color || '#4c97ff', x: -150, y: -52, scripts: [
+      [flag(), set('score', 0), set('speed', +(6 * p.speed).toFixed(1)), set('vy', 0), showVar('score'), goXY(-150, -52),
+        forever(chg('vy', -1.2), chY(V('vy')),
+          iff(lt(ypos(), -52), setY(-52), set('vy', 0), iff(or(keyDown('space'), keyDown('up arrow')), set('vy', 15))))]] },
+    { key: 'Cactus', kind: 'cactus', color: '#3ecf6b', x: 250, y: -55, hidden: true, scripts: [
+      [flag(), hide(), wait(1), forever(clone('_myself_'), wait(rnd(1, 2.2)))],
+      [onClone(), goXY(250, -55), show(),
+        until(lt(xpos(), -250), chX(sub(0, V('speed'))), iff(touching('Runner'), bcast('game over'))),
+        chg('score', 1), chg('speed', 0.25), delClone()]] },
+    banner('Banner', 'GAME OVER', 'game over')],
+  how: 'Hold SPACE (or ↑) to jump over the cacti. Every cactus you clear is a point, and the world speeds up.' });
+
+T.clicker = p => ({ title: 'Cookie clicker', replace: true, vars: ['score', 'power', 'cost', 'auto', 'acost'], bg: bgFor(p, 'sunset'),
+  sprites: [
+    { key: 'Cookie', kind: 'cookie', color: '#d9a066', x: -70, y: 0, scripts: [
+      [flag(), set('score', 0), set('power', 1), set('cost', 10), set('auto', 0), set('acost', 50),
+        showVar('score'), showVar('power'), showVar('cost'), showVar('auto'), showVar('acost'), goXY(-70, 0), setSize(100)],
+      [onClick(), chg('score', V('power')), setSize(90), wait(0.05), setSize(100)],
+      [flag(), forever(wait(1), chg('score', V('auto')))]] },
+    { key: 'PowerUp', kind: 'button', label: 'Power +1', color: '#3ecf6b', x: 150, y: 40, scripts: [
+      [onClick(), ife(gt(V('score'), sub(V('cost'), 1)),
+        [chg('score', sub(0, V('cost'))), chg('power', 1), set('cost', round(mul(V('cost'), 1.6))), say('Stronger clicks!', 1)],
+        [say(join('Need ', join(V('cost'), ' points')), 1)])]] },
+    { key: 'AutoClick', kind: 'button', label: 'Auto +1/s', color: '#4c97ff', x: 150, y: -30, scripts: [
+      [onClick(), ife(gt(V('score'), sub(V('acost'), 1)),
+        [chg('score', sub(0, V('acost'))), chg('auto', 1), set('acost', round(mul(V('acost'), 1.8))), say('Auto-clicker online!', 1)],
+        [say(join('Need ', join(V('acost'), ' points')), 1)])]] }],
+  how: 'Click the cookie to score. Spend points on Power (more per click) and Auto (points every second). Prices go up each time.' });
+
+T.survive = p => ({ title: 'Survival chase', replace: true, vars: ['score'], bg: bgFor(p, 'forest'),
+  sprites: [
+    { key: 'Player', kind: 'hero', color: p.color || '#4c97ff', x: 0, y: 0, scripts: [
+      [flag(), set('score', 0), showVar('score'), resetTimer(), goXY(0, 0), forever(goTo('_mouse_'), set('score', round(timer())))]] },
+    { key: 'Chaser', kind: 'enemy', color: '#ff4d6d', size: 90, x: 0, y: 160, hidden: true, scripts: [
+      [flag(), hide(), wait(1), forever(clone('_myself_'), wait(4))],
+      [onClone(), rotStyle('left-right'), ife(eq(rnd(1, 2), 1), [goXY(rnd(-220, 220), 165)], [goXY(rnd(-220, 220), -165)]), show(),
+        forever(towards('Player'), move(+(2.2 * p.speed).toFixed(1)), iff(touching('Player'), bcast('game over')))]] },
+    banner('Banner', 'CAUGHT!', 'game over')],
+  how: 'Your hero follows the mouse. A new chaser spawns every 4 seconds — survive as long as you can. Your score is your time.' });
+
+T.quiz = p => {
+  const sym = { add: ' + ', sub: ' - ', mul: ' x ' }[p.mode], op = { add, sub, mul }[p.mode];
+  const [lo, hi] = p.mode === 'mul' ? [2, 12] : [1, 12];
+  const setAB = p.mode === 'sub' ? [set('a', rnd(10, 20)), set('b', rnd(1, 10))] : [set('a', rnd(lo, hi)), set('b', rnd(lo, hi))];
+  const nm = { add: 'Addition', sub: 'Subtraction', mul: 'Multiplication' }[p.mode];
+  return { title: nm + ' quiz', replace: true, vars: ['score', 'a', 'b'], bg: bgFor(p, 'forest'),
+    sprites: [{ key: 'Teacher', kind: 'hero', color: p.color || '#9966ff', size: 160, x: 0, y: -30, scripts: [[
+      flag(), set('score', 0), showVar('score'), goXY(0, -30), say('Ready? Let\'s go!', 1.5),
+      repeat(p.q, ...setAB, ask(join(V('a'), join(sym, join(V('b'), ' = ?')))),
+        ife(eq(answer(), op(V('a'), V('b'))), [say('Correct!', 1), chg('score', 1)], [say(join('Not quite - it is ', op(V('a'), V('b'))), 2)])),
+      say(join('You got ', join(V('score'), join(' out of ', p.q))), 5)]] }],
+    how: `${p.q} ${nm.toLowerCase()} questions. Type your answer in the box under the stage. Say "multiplication quiz" or "10 questions" to change it.` };
+};
+
+T.chatbot = p => ({ title: 'Chatbot', replace: true, vars: ['name'], bg: bgFor(p, 'sky'),
+  sprites: [{ key: 'Bot', kind: 'hero', color: p.color || '#ff7eb6', size: 160, x: 0, y: -30, scripts: [[
+    flag(), goXY(0, -30), ask('Hi! I am a chatbot. What is your name?'), set('name', answer()),
+    say(join('Nice to meet you, ', V('name')), 2), ask('How are you feeling today?'),
+    ife(any(contains(answer(), 'good'), contains(answer(), 'great'), contains(answer(), 'happy')), [say('Awesome, glad to hear it!', 2)],
+      [ife(any(contains(answer(), 'bad'), contains(answer(), 'sad'), contains(answer(), 'tired')), [say('Aw, I hope your day gets better.', 2)], [say('I see! Thanks for sharing.', 2)])]),
+    ask('Want to hear a joke? (yes / no)'),
+    ife(contains(answer(), 'yes'), [say('Why was the computer cold?', 2), say('It left its Windows open!', 3)], [say('No problem. Bye for now!', 2)])]] }],
+  how: 'Click the green flag and answer the questions in the box under the stage.' });
+
+T.dash = p => {
+  const col = p.color || '#3ef0a8', sp = +(6 * p.speed).toFixed(1);
+  return { title: 'Geometry Dash', replace: true, vars: ['attempt', 'progress', 'speed', 'vy', 'pick'], bg: bgFor(p, 'neon', { ground: '#12073a', gline: '#00e5ff' }),
+    sprites: [
+      { key: 'Cube', kind: 'cube', color: col, x: -140, y: -60, scripts: [
+        [flag(), set('attempt', 0), showVar('attempt'), showVar('progress'), goXY(-140, -60), wait(0.3), bcast('restart')],
+        [onMsg('restart'), chg('attempt', 1), set('progress', 0), set('speed', sp), set('vy', 0), goXY(-140, -60), point(90), show(),
+          forever(chg('vy', -1.4), chY(V('vy')),
+            ife(lt(ypos(), -60), [setY(-60), set('vy', 0), point(90), iff(any(keyDown('space'), keyDown('up arrow'), mouseDown()), set('vy', 14.5))], [turnR(9)]),
+            chg('progress', 0.05), iff(lt(V('speed'), 9), chg('speed', 0.0015)),
+            iff(touching('Obstacle'), bcast('dead')), iff(gt(V('progress'), 99.9), bcast('win')))],
+        [onMsg('dead'), stopOther(), hide(), wait(0.6), bcast('restart')]] },
+      { key: 'Obstacle', kind: 'spike', color: '#ff5c8a', x: 260, y: -62, hidden: true,
+        costumes: [{ name: 'spike', kind: 'spike' }, { name: 'double', kind: 'spike2' }, { name: 'block', kind: 'block', color: '#7a5cff' }], scripts: [
+        [flag(), hide()], [onMsg('restart'), delClone()],
+        [onMsg('restart'), hide(), wait(0.8), forever(clone('_myself_'), wait(div(rnd(200, 330), mul(V('speed'), 30))))],
+        [onMsg('dead'), stopOther()],
+        [onClone(), set('pick', rnd(1, 3)),
+          iff(eq(V('pick'), 1), costume('spike'), goXY(260, -62)), iff(eq(V('pick'), 2), costume('double'), goXY(280, -62)), iff(eq(V('pick'), 3), costume('block'), goXY(260, -60)),
+          show(), until(lt(xpos(), -280), chX(sub(0, V('speed')))), delClone()]] },
+      banner('Win', 'LEVEL CLEAR!', 'win', '#3ef0a8')],
+    how: 'Press SPACE, ↑ or click the stage to jump. Jump over spikes and blocks — touch one and you instantly restart (the attempt counter goes up). Reach 100% progress to clear the level. It gets faster as you go.' };
+};
+
+const INTENTS = {
+  catch: ['catch', 'fall(ing)?', 'basket', 'collect', 'apples?', 'coins?'], pong: ['pong', 'paddles?', 'table tennis'],
+  flappy: ['flappy', 'flap', 'pipes?', 'tappy'], shooter: ['shoot(er|ing)?', 'invaders?', 'asteroids?', 'space ?ship', 'space (game|shooter)', 'galaga', 'blaster', 'aliens?'],
+  runner: ['dino', 'runner', 'endless', 'cactus', 'obstacles?', 'jump over', 'chrome'], clicker: ['clicker', 'cookies?', 'idle', 'tycoon', 'upgrades?', 'incremental'],
+  survive: ['survive', 'chase', 'chaser', 'dodge', 'avoid', 'escape', 'run away', 'tag'],
+  quiz: ['quiz', 'trivia', 'math', 'multiplication', 'times tables?', 'addition', 'subtraction', 'flash ?cards?'],
+  dash: ['geometry dash', 'geometry', 'dash', 'gd', 'rhythm', 'spikes?', 'cube'],
+  chatbot: ['chat ?bot', 'talk to me', 'conversation', 'greeter', 'ai friend', 'virtual friend']
+};
+function pickTemplate(s) {
+  let best = null, bs = 0;
+  for (const [id, ws] of Object.entries(INTENTS)) {
+    const sc = ws.reduce((a, w) => a + (new RegExp('\\b' + w + '\\b').test(s) ? 1 : 0), 0);
+    if (sc > bs) { bs = sc; best = id; }
+  }
+  return best;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   6. BEHAVIOUR SNIPPETS  (add logic to the sprite you have selected)
+   ══════════════════════════════════════════════════════════════════ */
+function snippets(text, p, gy) {
+  const s = p.s, scripts = [], vars = [], did = [];
+  const sp = Math.round(5 * p.speed);
+  const take = (re, fn, label) => { const m = s.match(re); if (m) { fn(m); did.push(label); } };
+  take(/\b(move|walk|control|steer)\b.*\b(arrow|arrows|wasd|keys?|keyboard)\b|\b(arrow keys?|wasd)\b/, () => {
+    scripts.push([flag(), forever(
+      iff(or(keyDown('right arrow'), keyDown('d')), chX(sp)), iff(or(keyDown('left arrow'), keyDown('a')), chX(-sp)),
+      iff(or(keyDown('up arrow'), keyDown('w')), chY(sp)), iff(or(keyDown('down arrow'), keyDown('s')), chY(-sp)))]);
+  }, 'moves with the arrow keys / WASD');
+  take(/follow\w*.*\b(mouse|cursor|pointer)\b/, () => scripts.push([flag(), forever(goTo('_mouse_'))]), 'follows the mouse');
+  take(/\b(bounce|bouncing|dvd)\b/, () => scripts.push([flag(), point(rnd(30, 150)), forever(move(sp + 1), bounce())]), 'bounces around the stage');
+  take(/\b(spin|spinning|rotate|twirl)\b/, () => scripts.push([flag(), forever(turnR(5))]), 'spins');
+  take(/\b(jump|jumps|jumping)\b/, () => { vars.push('vy'); scripts.push([flag(), set('vy', 0),
+    forever(chg('vy', -1), chY(V('vy')), iff(lt(ypos(), gy), setY(gy), set('vy', 0), iff(keyDown('space'), set('vy', 13))))]); }, 'jumps with SPACE');
+  take(/\b(glide|wander|roam|float around|drift)\b/, () => scripts.push([flag(), forever(n('motion_glidesecstoxy', { SECS: 1, X: rnd(-200, 200), Y: rnd(-150, 150) }))]), 'glides around randomly');
+  take(/\b(animate|animation|walk cycle|flip costumes?)\b/, () => scripts.push([flag(), forever(nextCostume(), wait(0.15))]), 'animates through its costumes');
+  take(/\b(grow|bigger|get big)\b/, () => scripts.push([onClick(), chSize(10)]), 'grows when clicked');
+  take(/\b(shrink|smaller)\b/, () => scripts.push([onClick(), chSize(-10)]), 'shrinks when clicked');
+  take(/\b(color|colour)\b.*\b(click|touch|press)|\b(click|touch|press)\b.*\b(color|colour)/, () => scripts.push([onClick(), effect('COLOR', 25)]), 'changes colour when clicked');
+  take(/\b(disappear|vanish|hide)\b.*\b(click|touch)|\b(click|touch).*\b(disappear|vanish|hide)\b/, () => scripts.push([onClick(), hide()]), 'hides when clicked');
+  take(/\b(add|make|create|keep|count)\b.*\b(score|points)\b/, () => { vars.push('score'); scripts.push([flag(), set('score', 0), showVar('score')], [onClick(), chg('score', 1)]); }, 'has a score (+1 per click)');
+  take(/\b(timer|stopwatch|clock)\b/, () => scripts.push([flag(), resetTimer(), forever(say(round(timer())))]), 'shows a timer');
+  const sayM = text.match(/\bsay(?:s)?\s+["“']?([^"”']{1,60}?)["”']?(?:\s+(?:when|if|on|after)\b.*)?$/i);
+  if (sayM) {
+    const msg = sayM[1].trim();
+    scripts.push(/\b(click|touch)/.test(s) ? [onClick(), say(msg, 2)] : [flag(), say(msg, 2)]);
+    did.push(`says "${msg}"`);
+  }
+  return scripts.length ? { title: 'Sprite behaviour', current: scripts, vars, did } : null;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   7. BUILDER  (talks to the real Scratch VM)
+   ══════════════════════════════════════════════════════════════════ */
+const BLANK = 'cd21514d0531fdffb22204e0ec5ed84a';
+const undoStack = [];
+const OWN = (typeof window !== 'undefined') ? (window.__smOwned = window.__smOwned || { sprites: [], vars: [], tops: [] }) : { sprites: [], vars: [], tops: [] };
+async function wipe(vm) {
+  const rt = vm.runtime, stage = rt.getTargetForStage();
+  for (const id of OWN.sprites.splice(0)) { if (rt.getTargetById(id)) { try { vm.deleteSprite(id); } catch (e) {} } }
+  for (const id of OWN.tops.splice(0)) { try { stage.blocks.deleteBlock(id); } catch (e) {} }
+  for (const id of OWN.vars.splice(0)) {
+    try { rt.requestHideMonitor(id); } catch (e) {}
+    try { stage.deleteVariable(id); } catch (e) {}
+  }
+  undoStack.length = 0;
+}
+async function addSvgCostume(vm, target, name, svg, w, h) {
+  const st = vm.runtime.storage;
+  const asset = st.createAsset(st.AssetType.ImageVector, 'svg', new TextEncoder().encode(svg), null, true);
+  const md5 = asset.assetId + '.svg';
+  await vm.addCostume(md5, { name, dataFormat: 'svg', asset, md5, assetId: asset.assetId, bitmapResolution: 1, rotationCenterX: w / 2, rotationCenterY: h / 2 }, target.id);
+}
+async function makeSprite(vm, sp) {
+  const rt = vm.runtime, before = new Set(rt.targets.map(t => t.id));
+  const json = { isStage: false, name: sp.key, variables: {}, lists: {}, broadcasts: {}, blocks: {}, comments: {}, currentCostume: 0,
+    costumes: [{ assetId: BLANK, name: 'tmp', bitmapResolution: 1, md5ext: BLANK + '.svg', dataFormat: 'svg', rotationCenterX: 0, rotationCenterY: 0 }],
+    sounds: [], volume: 100, layerOrder: rt.targets.length + 1, visible: !sp.hidden, x: sp.x || 0, y: sp.y || 0,
+    size: sp.size || 100, direction: 90, draggable: false, rotationStyle: sp.rot || 'all around' };
+  await vm.addSprite(JSON.stringify(json));
+  const t = rt.targets.find(t => !before.has(t.id));
+  if (!t) throw new Error('Scratch did not accept the new sprite.');
+  const cos = sp.costumes || [{ name: sp.key, kind: sp.kind }];
+  for (const c of cos) { const { svg, w, h } = svgOf(c.kind, c.color || sp.color, c.label || sp.label); await addSvgCostume(vm, t, c.name, svg, w, h); }
+  t.deleteCostume(0); t.setCostume(0);
+  t.setXY(sp.x || 0, sp.y || 0); t.setSize(sp.size || 100); t.setVisible(!sp.hidden);
+  try { vm.renameSprite(t.id, sp.key); } catch (e) {}
+  return t;
+}
+async function setBackdrop(vm, bg) {
+  const st = vm.runtime.storage, asset = st.createAsset(st.AssetType.ImageVector, 'svg', new TextEncoder().encode(bgSVG(bg)), null, true);
+  const md5 = asset.assetId + '.svg', stage = vm.runtime.getTargetForStage();
+  await vm.addBackdrop(md5, { name: 'ScratchMind', dataFormat: 'svg', asset, md5, assetId: asset.assetId, bitmapResolution: 1, rotationCenterX: 240, rotationCenterY: 180 });
+  const first = stage.getCostumes()[0];
+  if (first && first.assetId === BLANK && stage.getCostumes().length > 1) stage.deleteCostume(0);
+  for (let i = stage.getCostumes().length - 2; i >= 0; i--) {
+    if (stage.getCostumes()[i].name === 'ScratchMind') stage.deleteCostume(i);
+  }
+}
+async function addScripts(vm, t, scripts, env, undo) {
+  if (!scripts || !scripts.length) return 0;
+  const existing = Object.values(t.blocks._blocks).filter(b => b.topLevel);
+  const y0 = existing.length ? Math.max(...existing.map(b => b.y || 0)) + 220 : 20;
+  const { blocks, tops } = compile(scripts, env, 30, y0);
+  const before = new Set(Object.keys(t.blocks._blocks));
+  if (vm.shareBlocksToTarget) await vm.shareBlocksToTarget(blocks, t.id);
+  else blocks.forEach(b => t.blocks.createBlock(b));
+  const made = Object.keys(t.blocks._blocks).filter(id => !before.has(id) && t.blocks._blocks[id].topLevel);
+  undo.tops.push({ t: t.id, ids: made });
+  if (t.isStage) OWN.tops.push(...made);
+  return tops;
+}
+async function build(plan) {
+  const vm = findVM();
+  if (!vm) throw new Error("I can't see the Scratch editor. Open scratch.mit.edu/projects/editor, then paste the script again.");
+  const rt = vm.runtime, stage = rt.getTargetForStage();
+  const undo = { title: plan.title, sprites: [], tops: [], restore: [], stats: { sprites: 0, scripts: 0 } };
+  const env = {
+    names: {},
+    v: name => {
+      const ex = Object.values(stage.variables).find(x => x.name === name && x.type === '');
+      if (ex) return ex.id;
+      const id = uid(); stage.createVariable(id, name, ''); OWN.vars.push(id); return id;
+    },
+    bc: name => {
+      const ex = Object.values(stage.variables).find(x => x.type === 'broadcast_msg' && x.name.toLowerCase() === name.toLowerCase());
+      if (ex) return ex.id;
+      const id = uid(); stage.createVariable(id, name, 'broadcast_msg'); return id;
+    }
+  };
+  if (plan.replace) {
+    await wipe(vm);
+    for (const t of [...rt.targets]) {
+      if (!t.isStage && t.isOriginal && t.sprite.name === 'Sprite1' && !Object.keys(t.blocks._blocks).length) {
+        try { undo.restore.push(vm.deleteSprite(t.id)); } catch (e) {}
+      }
+    }
+  }
+  (plan.vars || []).forEach(env.v);
+  const made = [];
+  for (const sp of plan.sprites || []) {
+    const t = await makeSprite(vm, sp);
+    env.names[sp.key] = t.sprite.name; made.push([t, sp]); undo.sprites.push(t.id); OWN.sprites.push(t.id); undo.stats.sprites++;
+  }
+  if (plan.bg) await setBackdrop(vm, plan.bg);
+  for (const [t, sp] of made) undo.stats.scripts += await addScripts(vm, t, sp.scripts, env, undo);
+  if (plan.stage && plan.stage.length) undo.stats.scripts += await addScripts(vm, stage, plan.stage, env, undo);
+  if (plan.current && plan.current.length) {
+    let t = vm.editingTarget;
+    if (!t || t.isStage) t = rt.targets.find(x => !x.isStage && x.isOriginal);
+    if (!t) throw new Error('There is no sprite to add this to — add a sprite first.');
+    undo.stats.scripts += await addScripts(vm, t, plan.current, env, undo);
+    vm.setEditingTarget(t.id);
+  } else if (made.length) vm.setEditingTarget(made[0][0].id);
+  try { (vm.refreshWorkspace || vm.emitWorkspaceUpdate).call(vm); vm.emitTargetsUpdate && vm.emitTargetsUpdate(); } catch (e) {}
+  undoStack.push(undo);
+  return undo;
+}
+async function undoLast() {
+  const vm = findVM(), u = undoStack.pop();
+  if (!vm || !u) return false;
+  for (const { t, ids } of u.tops) { const tg = vm.runtime.getTargetById(t); if (tg) ids.forEach(id => { try { tg.blocks.deleteBlock(id); } catch (e) {} }); }
+  for (const id of u.sprites) { try { vm.deleteSprite(id); } catch (e) {} }
+  for (const r of u.restore) { try { if (typeof r === 'function') await r(); } catch (e) {} }
+  try { vm.emitWorkspaceUpdate(); } catch (e) {}
+  return u.title;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   8. BRAINS:  local rules  +  optional Claude
+   ══════════════════════════════════════════════════════════════════ */
+const HELP = `I build real Scratch projects: sprites, art, variables and block scripts.\n\n**Full games:** catch game · pong · flappy bird · geometry dash · space shooter · dino runner · cookie clicker · survival chase · math quiz · chatbot\n**Tweak the selected sprite:** "make it move with arrow keys", "follow the mouse", "spin", "bounce around", "jump", "say hi when clicked", "add a score"\n**Customise:** add words like *red*, *night*, *fast*, *easy*, *5 lives*, *multiplication*, *10 questions*\n**Commands:** /run · /stop · /undo · /key sk-ant-… (turn on the Claude brain) · /brain local`;
+const OPEN_MSG = `Hi! I'm **ScratchMind**. Tell me what to build — for example *"make a flappy bird game"* or *"make a night space shooter with 5 lives"*. Type **help** to see everything I can do.`;
+
+function localThink(text) {
+  const p = parse(text), s = p.s.trim();
+  if (/\b(help|what can you|commands?)\b/.test(s) && s.length < 40) return { reply: HELP };
+  if (/^(hi|hello|hey|yo|sup)\b/.test(s) && s.length < 20) return { reply: OPEN_MSG };
+  const thisSprite = /\b(this|my|current|selected|the) sprite\b|\b(make|let) (it|him|her|them)\b/.test(s);
+  const tm = pickTemplate(s);
+  if (tm && !thisSprite) return { plan: T[tm](p) };
+  const vm = findVM(), et = vm && vm.editingTarget;
+  const sn = snippets(text, p, et && !et.isStage ? Math.round(et.y) : -52);
+  if (sn) return { plan: sn };
+  if (tm) return { plan: T[tm](p) };
+  const CLOSE = [[/mario|sonic|platform|parkour|jump/, 'runner', 'a runner (jump over obstacles)'], [/breakout|brick|arkanoid|tennis|badminton/, 'pong', 'pong'],
+    [/asteroid|galaga|invader|tank|war|zombie|gun/, 'shooter', 'a space shooter'], [/subway|temple|endless/, 'runner', 'a runner'], [/trivia|exam|test|flashcard/, 'quiz', 'a quiz'],
+    [/agar|tag|pac|ghost|maze|escape/, 'survive', 'a survival chase'], [/idle|farm|tycoon|cookie/, 'clicker', 'a clicker'], [/fruit|ninja|pinata|drop/, 'catch', 'a catch game']].find(([re]) => re.test(s));
+  if (CLOSE) return { reply: `I can't build that exactly, but the closest thing I can make is **${CLOSE[2]}**. Say *"make ${CLOSE[2].replace(/^an? /, '').replace(/ \(.*\)/, '')}"* and I'll build it — or add **/key sk-ant-…** and Claude will design the real thing.` };
+  return { reply: `I'm not sure how to build that yet. Here's what I'm good at:\n\n${HELP}\n\nFor open-ended ideas, give me an API key with **/key sk-ant-…** and I'll use Claude to design the project.` };
+}
+
+const LLM_SYSTEM = `You design Scratch 3 projects. Reply with ONLY a JSON object: {"reply":"short friendly explanation","plan":PLAN|null}.
+PLAN = {"title":str,"replace":bool,"vars":[names],"bg":{"c1":"#hex","c2":"#hex","stars":0|1,"ground":0|1}|null,"sprites":[SPRITE],"stage":[SCRIPT],"how":"how to play"}
+SPRITE = {"key":"UniqueName","kind":one of ball|paddle|basket|apple|star|coin|hero|enemy|alien|ship|bullet|bird|pipe|cactus|cookie|button|banner,"color":"#hex","label":"text for button/banner","x":n,"y":n,"size":percent,"hidden":bool,"scripts":[SCRIPT]}
+SCRIPT = array of NODE; the first NODE must be a hat block. NODE = {"op":"scratch_opcode","i":{INPUT:value},"f":{FIELD:value}}.
+Input value = number | string | NODE (reporter/boolean) | [NODE,...] (C-block substack: SUBSTACK, SUBSTACK2). Field value = string, or {"var":"name"} for variable fields, or {"bc":"message"} for broadcast fields.
+Opcodes: event_whenflagclicked, event_whenkeypressed(f KEY_OPTION e.g. "space","left arrow","a"), event_whenthisspriteclicked, event_whenstageclicked, event_whenbroadcastreceived(f BROADCAST_OPTION {"bc":..}), event_broadcast(i BROADCAST_INPUT "msg"), control_forever, control_repeat(TIMES), control_repeat_until(CONDITION), control_if(CONDITION), control_if_else, control_wait(DURATION), control_create_clone_of(CLONE_OPTION sprite key or "_myself_"), control_start_as_clone, control_delete_this_clone, control_stop(f STOP_OPTION "all"), motion_movesteps(STEPS), motion_turnright(DEGREES), motion_gotoxy(X,Y), motion_goto(TO "_mouse_"/sprite key), motion_changexby(DX), motion_changeyby(DY), motion_setx(X), motion_sety(Y), motion_pointindirection(DIRECTION), motion_pointtowards(TOWARDS), motion_ifonedgebounce, motion_xposition, motion_yposition, motion_direction, looks_say(MESSAGE), looks_sayforsecs(MESSAGE,SECS), looks_show, looks_hide, looks_setsizeto(SIZE), looks_changesizeby(CHANGE), looks_nextcostume, looks_gotofrontback(f FRONT_BACK "front"), sensing_touchingobject(TOUCHINGOBJECTMENU sprite key/"_edge_"/"_mouse_"), sensing_keypressed(KEY_OPTION), sensing_mousex, sensing_mousey, sensing_mousedown, sensing_askandwait(QUESTION), sensing_answer, sensing_timer, sensing_resettimer, operator_add/subtract/multiply/divide(NUM1,NUM2), operator_random(FROM,TO), operator_gt/lt/equals(OPERAND1,OPERAND2), operator_and/or(OPERAND1,OPERAND2), operator_not(OPERAND), operator_join(STRING1,STRING2), operator_round(NUM), data_variable(f VARIABLE {"var":..}), data_setvariableto(VALUE; f VARIABLE), data_changevariableby(VALUE; f VARIABLE), data_showvariable(f VARIABLE).
+Rules: Stage is 480x360 (x -240..240, y -180..180). Hide template sprites and spawn clones; a sprite that clones "_myself_" needs a flag script that hides it and a control_start_as_clone script that shows it. Use a "game over" broadcast plus a banner sprite (kind banner, hidden, script [onMsg game over → goto 0,0, front, show, stop all]) for game endings. Put a short wait(0.3) before loops that read variables set by other sprites. Keep it compact but complete and actually playable. If the user is only chatting, set plan to null.`;
+
+let CFG = { key: '', brain: 'local', model: 'claude-sonnet-5-5' };
+function cleanNode(nd, depth = 0) {
+  if (!nd || typeof nd !== 'object' || depth > 40 || !/^(motion|looks|sound|event|control|sensing|operator|data)_[a-z_]+$/.test(nd.op || '')) throw new Error('bad block: ' + JSON.stringify(nd).slice(0, 60));
+  const out = { op: nd.op, i: {}, f: {}, m: nd.op === 'control_stop' ? { tagName: 'mutation', children: [], hasnext: /other/.test(JSON.stringify(nd.f || {})) ? 'true' : 'false' } : undefined };
+  for (const [k, v] of Object.entries(nd.i || {})) out.i[k] = Array.isArray(v) ? v.map(x => cleanNode(x, depth + 1)) : (v && typeof v === 'object') ? cleanNode(v, depth + 1) : v;
+  for (const [k, v] of Object.entries(nd.f || {})) out.f[k] = v;
+  return out;
+}
+function sanitize(p) {
+  const out = { title: String(p.title || 'Project').slice(0, 40), replace: !!p.replace, vars: (p.vars || []).map(String).slice(0, 20), how: p.how || '', stage: [], sprites: [] };
+  if (p.bg && p.bg.c1) out.bg = { c1: p.bg.c1, c2: p.bg.c2 || p.bg.c1, stars: p.bg.stars, ground: p.bg.ground, mid: p.bg.mid };
+  const sc = list => (list || []).filter(Array.isArray).map(s => s.map(x => cleanNode(x)));
+  out.stage = sc(p.stage);
+  out.sprites = (p.sprites || []).slice(0, 10).map((s, i) => ({ key: String(s.key || 'Sprite' + (i + 1)).slice(0, 30), kind: ART[s.kind] ? s.kind : 'ball',
+    color: /^#[0-9a-f]{6}$/i.test(s.color) ? s.color : '#4c97ff', label: s.label, x: +s.x || 0, y: +s.y || 0, size: +s.size || 100, hidden: !!s.hidden, scripts: sc(s.scripts) }));
+  return out;
+}
+async function claudeThink(text, history) {
+  const res = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-api-key': CFG.key, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
+    body: JSON.stringify({ model: CFG.model, max_tokens: 8000, system: LLM_SYSTEM, messages: history.concat([{ role: 'user', content: text }]) }) });
+  if (!res.ok) throw new Error('API ' + res.status + ': ' + (await res.text()).slice(0, 160));
+  const data = await res.json(), raw = data.content.map(c => c.text || '').join('');
+  const j = JSON.parse(raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1));
+  return { reply: j.reply, plan: j.plan ? sanitize(j.plan) : null, raw };
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   9. CHAT CONTROLLER + UI
+   ══════════════════════════════════════════════════════════════════ */
+const history = [];
+const UNSUP = [[/\b(sounds?|music|noises?)\b/, 'sound effects or music'], [/\bpower-?ups?\b/, 'power-ups'], [/\bbosse?s?\b/, 'boss fights'],
+  [/\b(multiplayer|online|network)\b/, 'online play'], [/\b(leaderboard|high ?scores?)\b/, 'saved high scores'], [/\b(3d|three d)\b/, '3D graphics']];
+const unsupported = t => UNSUP.filter(([re]) => re.test(t.toLowerCase())).map(x => x[1]);
+function describe(plan, u) {
+  if (plan.current) return `Done — I added ${u.stats.scripts} script${u.stats.scripts === 1 ? '' : 's'} to your selected sprite${plan.did && plan.did.length ? ' so it ' + plan.did.join(', and ') : ''}. Click the green flag to try it.`;
+  return `**${plan.title}** is built: ${u.stats.sprites} sprite${u.stats.sprites === 1 ? '' : 's'}, ${(plan.vars || []).length} variable${(plan.vars || []).length === 1 ? '' : 's'}, ${u.stats.scripts} scripts.\n\n${plan.how || ''}\n\nAnything I built earlier was replaced (say *also* or *too* if you want to keep it). Press the **green flag** (or type /run). Scripts are stacked in a column — right-click the code area and pick *Clean up Blocks* to tidy. Say *undo* to remove it.`;
+}
+async function handle(text, ui) {
+  const t = text.trim(), s = t.toLowerCase();
+  if (s === '/clear') { ui.clear(); return; }
+  if (s === '/run' || /^(run|start|go|green flag|play it|test it)$/.test(s)) { const vm = findVM(); if (!vm) return ui.bot('No Scratch editor found.'); vm.greenFlag(); return ui.bot('Green flag clicked ▶'); }
+  if (s === '/stop' || /^(stop|halt)$/.test(s)) { const vm = findVM(); if (vm) vm.stopAll(); return ui.bot('Stopped ■'); }
+  if (/^\/?undo$/.test(s)) { const r = await undoLast(); return ui.bot(r ? `Undid **${r}**.` : 'Nothing to undo.'); }
+  const km = t.match(/^\/key\s+(\S+)/i);
+  if (km) { CFG.key = km[1]; CFG.brain = 'claude'; return ui.bot('Claude brain **on**. The key stays in memory only (gone when you reload). If the request fails I fall back to the local brain. Use **/brain local** to switch back.'); }
+  const mm = t.match(/^\/model\s+(\S+)/i); if (mm) { CFG.model = mm[1]; return ui.bot('Model set to ' + CFG.model); }
+  if (/^\/brain\s+local/i.test(t)) { CFG.brain = 'local'; return ui.bot('Local brain on.'); }
+  if (/^\/brain\s+claude/i.test(t)) { if (!CFG.key) return ui.bot('Add a key first: /key sk-ant-…'); CFG.brain = 'claude'; return ui.bot('Claude brain on.'); }
+  let out = null;
+  if (CFG.brain === 'claude' && CFG.key) {
+    try { out = await claudeThink(t, history); history.push({ role: 'user', content: t }, { role: 'assistant', content: out.raw }); if (history.length > 12) history.splice(0, 2); }
+    catch (e) { ui.bot('Claude brain failed (' + e.message + '). Using the local brain for this one.'); }
+  }
+  if (!out) out = localThink(t);
+  if (out.reply && !out.plan) return ui.bot(out.reply);
+  if (!out.plan) return ui.bot('I had nothing to build for that.');
+  if (out.reply) ui.bot(out.reply);
+  if (/\b(also|too|as well|in addition|combine|another one|keep (the|my) (old|other|current))\b/i.test(t) && out.plan.replace) out.plan.replace = false;
+  ui.status('Building…');
+  const u = await build(out.plan);
+  ui.bot(describe(out.plan, u));
+  const miss = unsupported(t);
+  if (miss.length && !(CFG.brain === 'claude' && CFG.key)) ui.bot(`I couldn't add **${miss.join(', ')}** with my built-in brain. Type **/key sk-ant-…** to let Claude design those, or ask me to adjust something I can do.`);
+}
+
+function mountUI() {
+  const host = document.createElement('div');
+  host.id = 'scratchmind-host';
+  host.style.cssText = 'position:fixed;right:20px;bottom:20px;z-index:2147483000;';
+  const root = host.attachShadow({ mode: 'open' });
+  root.innerHTML = `
+<style>
+:host{all:initial}
+*{box-sizing:border-box;font-family:"Trebuchet MS","Segoe UI",ui-rounded,system-ui,sans-serif}
+.panel{width:392px;height:572px;max-height:calc(100vh - 40px);display:flex;flex-direction:column;background:#f3f5ff;border-radius:22px;overflow:hidden;
+  box-shadow:0 0 0 2px #2a1f45,8px 8px 0 #2a1f45,0 24px 60px rgba(42,31,69,.3);color:#2a1f45}
+.panel.min{display:none}
+header{display:flex;align-items:center;gap:12px;padding:12px 14px;background:#2a1f45;color:#fff;cursor:grab;user-select:none}
+header:active{cursor:grabbing}
+.logo{width:34px;display:flex;flex-direction:column;gap:2px}
+.logo i{display:block;height:9px;border-radius:3px;position:relative}
+.logo i:before{content:"";position:absolute;left:5px;top:-3px;width:9px;height:3px;border-radius:2px 2px 0 0;background:inherit}
+.logo i:nth-child(1){background:#ffab19;width:30px}.logo i:nth-child(2){background:#4c97ff;width:34px}.logo i:nth-child(3){background:#59c059;width:26px}
+.ttl{flex:1;line-height:1.1}.ttl b{font-size:17px;letter-spacing:.2px}.ttl small{display:block;margin-top:3px;font-size:11.5px;color:#bfb2e6}
+.hb{border:0;background:#3b2d63;color:#fff;border-radius:9px;min-width:32px;height:30px;font-size:14px;cursor:pointer;padding:0 8px}
+.hb:hover{background:#5a47a0}.hb.go{background:#59c059;color:#102a10}.hb.go:hover{background:#6fd96f}.hb.st{background:#ff6680;color:#3a0010}
+.log{flex:1;overflow:auto;padding:16px 14px 8px;display:flex;flex-direction:column;gap:12px;scroll-behavior:smooth}
+.m{max-width:88%;padding:10px 13px;font-size:14px;line-height:1.45;word-wrap:break-word;white-space:pre-wrap}
+.m.bot{align-self:flex-start;background:#fff;border:2px solid #2a1f45;border-radius:4px 16px 16px 16px;position:relative;margin-top:6px}
+.m.bot:before{content:"";position:absolute;left:12px;top:-8px;width:16px;height:6px;background:#fff;border:2px solid #2a1f45;border-bottom:0;border-radius:4px 4px 0 0}
+.m.me{align-self:flex-end;background:#7b4fd6;color:#fff;border-radius:16px 16px 4px 16px}
+.m code{background:#ece8fb;border-radius:5px;padding:0 4px;font-family:Consolas,monospace;font-size:12.5px}
+.m b{font-weight:800}.m.stat{align-self:center;background:none;color:#7a6aa8;font-size:12.5px;padding:0}
+.dots span{display:inline-block;width:7px;height:7px;margin:0 2px;border-radius:50%;background:#7b4fd6;animation:b 1s infinite}
+.dots span:nth-child(2){animation-delay:.15s}.dots span:nth-child(3){animation-delay:.3s}
+@keyframes b{0%,60%,100%{transform:translateY(0);opacity:.5}30%{transform:translateY(-5px);opacity:1}}
+@media (prefers-reduced-motion:reduce){.dots span{animation:none}.log{scroll-behavior:auto}}
+.chips{display:flex;gap:6px;padding:4px 12px 8px;overflow-x:auto;scrollbar-width:none}
+.chips::-webkit-scrollbar{display:none}
+.chip{flex:none;border:2px solid #2a1f45;background:#fff;color:#2a1f45;border-radius:999px;padding:4px 11px;font-size:12.5px;font-weight:700;cursor:pointer}
+.chip:hover{background:#ffab19}
+.bar{display:flex;gap:8px;padding:10px 12px 12px;border-top:2px solid #2a1f45;background:#fff}
+textarea{flex:1;resize:none;height:44px;border:2px solid #2a1f45;border-radius:12px;padding:10px 12px;font-size:14px;color:#2a1f45;background:#f3f5ff;outline:none}
+textarea:focus{border-color:#7b4fd6;background:#fff}
+.send{width:48px;border:0;border-radius:12px;background:#ffab19;color:#2a1f45;font-weight:900;font-size:18px;cursor:pointer;box-shadow:0 3px 0 #b87400}
+.send:active{transform:translateY(2px);box-shadow:0 1px 0 #b87400}.send:disabled{opacity:.5;cursor:default}
+.hb:focus-visible,.chip:focus-visible,.send:focus-visible{outline:3px solid #7b4fd6;outline-offset:2px}
+.fab{display:none;width:58px;height:58px;border-radius:18px;border:0;background:#2a1f45;cursor:pointer;box-shadow:4px 4px 0 #ffab19;align-items:center;justify-content:center}
+.fab.on{display:flex}.fab .logo{transform:scale(.9)}
+</style>
+<div class="panel" role="dialog" aria-label="ScratchMind chat">
+  <header><div class="logo"><i></i><i></i><i></i></div><div class="ttl"><b>ScratchMind</b><small>tell me what to build</small></div>
+    <button class="hb go" data-a="run" title="Green flag">▶</button><button class="hb st" data-a="stop" title="Stop">■</button>
+    <button class="hb" data-a="min" title="Minimise">–</button><button class="hb" data-a="close" title="Close">✕</button></header>
+  <div class="log" aria-live="polite"></div>
+  <div class="chips"></div>
+  <div class="bar"><textarea placeholder="e.g. make a flappy bird game" rows="1"></textarea><button class="send" title="Send">➤</button></div>
+</div>
+<button class="fab" title="Open ScratchMind"><div class="logo"><i></i><i></i><i></i></div></button>`;
+  document.body.appendChild(host);
+
+  const $ = s => root.querySelector(s), log = $('.log'), ta = $('textarea'), send = $('.send'), panel = $('.panel'), fab = $('.fab');
+  const md = s => esc(s).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/\*(.+?)\*/g, '<i>$1</i>').replace(/`(.+?)`/g, '<code>$1</code>');
+  const addMsg = (cls, html) => { const d = document.createElement('div'); d.className = 'm ' + cls; d.innerHTML = html; log.appendChild(d); log.scrollTop = log.scrollHeight; return d; };
+  let typing = null;
+  const ui = {
+    bot: t => { ui.status(null); addMsg('bot', md(t)); },
+    me: t => addMsg('me', esc(t)),
+    clear: () => { log.innerHTML = ''; ui.bot(OPEN_MSG); },
+    status: t => { if (typing) { typing.remove(); typing = null; } if (t) typing = addMsg('bot', '<span class="dots"><span></span><span></span><span></span></span> ' + esc(t)); }
+  };
+  ['Catch game', 'Pong', 'Flappy bird', 'Geometry dash', 'Space shooter', 'Dino runner', 'Cookie clicker', 'Math quiz', 'Chatbot', 'Make it follow the mouse'].forEach(c => {
+    const b = document.createElement('button'); b.className = 'chip'; b.textContent = c;
+    b.onclick = () => submit(/^make/i.test(c) ? c : 'make a ' + c.toLowerCase()); root.querySelector('.chips').appendChild(b);
+  });
+  let busy = false; const hist = []; let hi = 0;
+  async function submit(text) {
+    text = (text || ta.value).trim(); if (!text || busy) return;
+    ta.value = ''; hist.push(text); hi = hist.length; ui.me(text); busy = true; send.disabled = true; ui.status('Thinking…');
+    try { await handle(text, ui); } catch (e) { console.error('[ScratchMind]', e); ui.bot('Something went wrong: ' + (e && e.message || e)); }
+    busy = false; send.disabled = false; ui.status(null); ta.focus();
+  }
+  send.onclick = () => submit();
+  ['keydown', 'keyup', 'keypress'].forEach(ev => ta.addEventListener(ev, e => e.stopPropagation()));
+  ta.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); }
+    else if (e.key === 'ArrowUp' && !ta.value && hist.length) { hi = Math.max(0, hi - 1); ta.value = hist[hi]; }
+  });
+  root.querySelector('header').addEventListener('click', e => {
+    const a = e.target.dataset && e.target.dataset.a; if (!a) return;
+    if (a === 'run') submit('/run'); if (a === 'stop') submit('/stop');
+    if (a === 'min') { panel.classList.add('min'); fab.classList.add('on'); }
+    if (a === 'close') api.destroy();
+  });
+  fab.onclick = () => { panel.classList.remove('min'); fab.classList.remove('on'); ta.focus(); };
+  /* drag by header */
+  const hd = root.querySelector('header'); let dx = 0, dy = 0, drag = false;
+  hd.addEventListener('mousedown', e => { if (e.target.closest('button')) return; drag = true; const r = host.getBoundingClientRect(); dx = e.clientX - r.left; dy = e.clientY - r.top; e.preventDefault(); });
+  addEventListener('mousemove', api_move = e => { if (!drag) return; host.style.left = Math.max(0, e.clientX - dx) + 'px'; host.style.top = Math.max(0, e.clientY - dy) + 'px'; host.style.right = 'auto'; host.style.bottom = 'auto'; });
+  addEventListener('mouseup', api_up = () => (drag = false));
+  ui.bot(OPEN_MSG);
+  return { host, ui, ta };
+}
+let api_move, api_up;
+
+const api = { destroy() { const h = document.getElementById('scratchmind-host'); if (h) h.remove(); removeEventListener('mousemove', api_move); removeEventListener('mouseup', api_up); delete window.__scratchMind; },
+              build, compile, parse, T, localThink, snippets, sanitize, findVM, undoLast };
+if (typeof module !== 'undefined' && module.exports) { module.exports = api; return; }
+window.__scratchMind = api;
+mountUI();
+if (!findVM()) console.warn('[ScratchMind] Scratch VM not found yet — open the project editor (scratch.mit.edu/projects/editor).');
+console.log('%cScratchMind ready 🧠', 'font:700 14px sans-serif;color:#7b4fd6');
+})();
